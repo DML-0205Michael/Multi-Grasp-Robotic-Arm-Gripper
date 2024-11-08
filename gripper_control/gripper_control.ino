@@ -54,12 +54,14 @@ float M1_speed=0, M2_speed=0; // 0~+-4096
 
 const int S1_soft=1000, S1_hard=2000;
 const int S2_soft=1000, S2_hard=2000;
+int S1_angle, S2_angle;
 
-bool pump_status=0, mode=2, finger_hardness=0;
+bool pump_status=0, mode=2, hardness=0;
+String hardness_str="Hard", pump_status_str="OFF";
 int gripper_status=0; // 0=stop, -1=open, 1=close
 ////////////////////////////////////////////////////////////// MOTOR //////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////// OLED //////////////////////////////////////////////////////////////
-#include <SPI.h>
+// #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -92,6 +94,9 @@ static const unsigned char PROGMEM logo_bmp[] =
   0b01111100, 0b11110000,
   0b01110000, 0b01110000,
   0b00000000, 0b00110000 };
+
+// create task on core 1
+TaskHandle_t display_update_task;
 ////////////////////////////////////////////////////////////// OLED //////////////////////////////////////////////////////////////
 
 void setup() {
@@ -114,15 +119,38 @@ void setup() {
 }
 
 void loop() {
-  display_loop();
   loop_time_holder();
   control();
   motor_output_loop();
   // Serial.print(count_1); Serial.print("\t");
   // Serial.print(count_2); Serial.print("\t");
+  Serial.print("Loop running on core ");
+  Serial.print(xPortGetCoreID());
   Serial.println();
+  taskYIELD();
 }
 
+////////////////////////////////////////////// TIME //////////////////////////////////////////////
+unsigned long loop_start_time=0;
+unsigned long loop2_start_time=0;
+const int loop_time=10000; // micro seconds
+void loop_time_holder(){
+  vTaskDelay(5);
+  
+  if(micros() - loop_start_time > (loop_time+50)) digitalWrite(2, HIGH);
+  else digitalWrite(2, LOW);
+
+  unsigned long while_start_time=micros();
+  while ((micros()- loop_start_time)<loop_time){} 
+  // delayMicroseconds(loop_time-(while_start_time-loop_start_time));
+  int dt=micros()-loop_start_time;
+  // unsigned long while_end_time=micros();
+  // Serial.print("while time:");Serial.print(while_end_time-while_start_time);Serial.print("  ");
+  Serial.print("dt:");Serial.print(dt);Serial.print(" on core ");
+  Serial.print(xPortGetCoreID());Serial.print("  ");
+  loop_start_time = micros(); 
+}
+////////////////////////////////////////////// TIME //////////////////////////////////////////////
 ////////////////////////////////////////////////////////////// Inputs //////////////////////////////////////////////////////////////
 void input_setup(){
   pinMode(enc_1A_pin, INPUT);
@@ -144,11 +172,6 @@ void input_setup(){
   attachInterrupt(KEY3,fc3,FALLING);
   attachInterrupt(KEY4,fc4,FALLING);
   attachInterrupt(KEY5,fc5,FALLING);
-  // attachInterrupt(KEY1,fc1,RISING);
-  // attachInterrupt(KEY2,fc2,RISING);
-  // attachInterrupt(KEY3,fc3,RISING);
-  // attachInterrupt(KEY4,fc4,RISING);
-  // attachInterrupt(KEY5,fc5,RISING);
 }
 
 void enc_1_A(){
@@ -181,34 +204,14 @@ void enc_2_B(){
 
 unsigned long mode_change_time=0;
 void fc1(){
-  // long t=millis();
-  // if ((t-mode_change_time)>300){
-  //   Serial.println("Key 1 pressed");
-  //   mode_change_time=millis();
-  // }
-  // pump_status=!pump_status;
-  // Serial.print(key1_time-micros());
   if(!digitalRead(KEY1))
   Serial.println("Key 1 pressed");
-  // key1_time=micros();
 }
 void fc2(){
-  // long t=millis();
-  // if ((t-mode_change_time)>300){
-  //   Serial.println("Key 2 pressed");
-  //   mode_change_time=millis();
-  // }
-  // mode=!mode;
   if(!digitalRead(KEY2))
   Serial.println("Key 2 pressed");
 }
 void fc3(){
-  // long t=millis();
-  // if ((t-mode_change_time)>300){
-  //   Serial.println("Key 3 pressed");
-  //   mode_change_time=millis();
-  // }
-
   // if (!mode){ 
 
   // }
@@ -222,10 +225,11 @@ void fc4(){
   Serial.println("Key 4 pressed");
 }
 void fc5(){
-  finger_hardness=!finger_hardness;
+  hardness=!hardness;
   if(!digitalRead(KEY5))
   Serial.println("Key 5 pressed");
 }
+
 ////////////////////////////////////////////////////////////// Inputs //////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////// Control //////////////////////////////////////////////////////////////
 void control(){
@@ -235,10 +239,17 @@ void control(){
   // Serial.print(4100); // To freeze the upper limit
   // Serial.print(" ");
 
-  // theta=acos((target_size-dist_const)/2/L);
-  // target=int(theta*4096/2/M_PI+theta_offset);
+  theta=acos((target_size-dist_const)/2/L);
+  int target_5600_reading=int(theta*4096/2/M_PI+theta_offset);
 
-  // position_PI(target,as5600_0.readAngle());
+  // actual_size=(as5600_0.readAngle()-theta_offset)*M_PI*2/4096;
+
+  // target_size=target_size+float(count_1*10/2+count_2);
+  count_1=0, count_2=0;
+  // target_size=constrain(target_size,0,120);
+  // Serial.print("target_size:");Serial.print(target_size); Serial.print(" ");
+  // position_PI(target_5600_reading,as5600_0.readAngle());
+  // position_PI(target_size,actual_size);
 
   if (!digitalRead(KEY1)){
     M1_speed=0;
@@ -320,6 +331,26 @@ void motor_output_loop(){
     digitalWrite(BIN2, LOW); digitalWrite(BIN1, HIGH);
     ledcWrite(M2_PWM_CH, abs(M2_speed));
   }
+
+  while ((micros()- loop2_start_time)<loop_time){} 
+    loop2_start_time = micros(); 
+    digitalWrite(S1_pin, HIGH);
+    digitalWrite(S2_pin, HIGH);
+    unsigned long S1_end_time=loop2_start_time+S1_angle;
+    unsigned long S2_end_time=loop2_start_time+S2_angle;
+
+    bool S1_state=1, S2_state=1;
+    while(S1_state || S2_state){
+      unsigned long now_time=micros();
+      if (S1_end_time<=now_time){
+        digitalWrite(S1_pin, LOW);
+        S1_state=0;
+      } else S1_state=1;
+      if (S2_end_time<=now_time){
+        digitalWrite(S2_pin, LOW); 
+        S2_state=0;
+      } else S2_state=1;
+    }
 }
 ////////////////////////////////////////////// MOTOR OUTPUT //////////////////////////////////////////////
 ////////////////////////////////////////////// I2C //////////////////////////////////////////////
@@ -344,14 +375,39 @@ void OLED_setup() {
   // display.display();
   // delay(1000); // Pause for 2 seconds
 
+  xTaskCreatePinnedToCore(
+    OLED_task,   /* Task function. */
+    "OLED Update",     /* name of task. */
+    10000,       /* Stack size of task */
+    NULL,        /* parameter of the task */
+    1,           /* priority of the task */
+    &display_update_task,      /* Task handle to keep track of created task */
+    1);          /* pin task to core 1 */
+}
+
+// void display_mode_dist(void * parameter) {
+//   for(;;){
+//     display.clearDisplay();
+//     display.setCursor(14,0); display.println(pump_status_str);
+//     display.setCursor(53,0); display.println(hardness_str);
+//     display.setCursor(116,0); display.println(mode+1);
+//     display.setCursor(45,16); display.println(target_size);
+//     display.setCursor(45,40); display.println(actual_size);
+//     display.display();
+//   }
+// }
+
+void OLED_task(void * parameter){
   display_team();
+  delay(10);
+  for(;;){
+    display_UI();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    Serial.print("OLED running on core ");
+    Serial.print(xPortGetCoreID());
+  }
 }
 
-void display_loop(){
-  // display_team();
-}
-
-float angle0;
 void display_team(void) {
   display.clearDisplay();
 
@@ -382,32 +438,11 @@ void display_team(void) {
   display.setCursor(0,16);     display.println(F("Aditya A"));
   display.setCursor(0,16+d);   display.println(F("Asher  M"));
   display.setCursor(0,16+2*d); display.println(F("Carter M"));
-  // display.setCursor(0,16+3*d); display.println(F("Dingming L"));
-  // display.setCursor(0,16+4*d); display.println(F("Owen D"));
-  // display.setCursor(0,16+5*d); display.println(F("Ryan K"));
-
   display.setCursor(65,16);     display.println(F("Dingming L"));
   display.setCursor(65,16+d);   display.println(F("Owen     D"));
   display.setCursor(65,16+2*d); display.println(F("Ryan     K"));
   display.display();
   delay(2000);
-}
-
-void display_mode_dist(void) {
-  // float angle0;
-  display.clearDisplay();
-
-  display.setTextSize(2);             // Normal 1:1 pixel scale
-  display.setTextColor(SSD1306_WHITE);        // Draw white text
-  display.setCursor(0,0);             // Start at top-left corner
-  display.println(F("Angle(rad): "));
-
-  display.setTextSize(5);             // Draw 2X-scale text
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(4,20); 
-  display.print(angle0); //display.println(angle0, HEX);
-
-  display.display();
 }
 
 void display_UI(void){
@@ -424,18 +459,18 @@ void display_UI(void){
   display.setCursor(0,16); display.println(F("Target"));
   display.setCursor(0,40); display.println(F("Actual"));
   display.setTextSize(2);             
+  display.setCursor(0,0);  display.println(F("P"));
+  display.setCursor(7,0);  display.println(F(":"));
   display.setCursor(105,0); display.println(F("M"));
   
   // data to change
-  display.setCursor(0,0);  display.println(F("S"));
-  display.setCursor(35,0); display.println(F("HA"));
-  display.setCursor(60,0); display.println(F("SO"));
+  display.setCursor(14,0); display.println(pump_status_str);
+  display.setCursor(53,0); display.println(hardness_str);
   display.setCursor(116,0); display.println(mode+1);
   display.setCursor(45,16); display.println(target_size);
   display.setCursor(45,40); display.println(actual_size);
-  
   display.display();
-  delay(2000);
+  // delay(2000);
 
   // display.clearDisplay();
   // display.setCursor(0,0);  display.println(F("SU"));
@@ -444,21 +479,15 @@ void display_UI(void){
   // display.setCursor(100,0); display.println(F("M:"));
   // display.setCursor(0,16); display.println(F("Actual"));
   // display.setCursor(0,46); display.println(F("Target"));
+  
+
+  // xTaskCreatePinnedToCore(
+  //   display_mode_dist,   /* Task function. */
+  //   "OLED Update",     /* name of task. */
+  //   10000,       /* Stack size of task */
+  //   NULL,        /* parameter of the task */
+  //   0,           /* priority of the task */
+  //   &display_update_task,      /* Task handle to keep track of created task */
+  //   1);          /* pin task to core 1 */
 }
 ////////////////////////////////////////////// I2C //////////////////////////////////////////////
-////////////////////////////////////////////// TIME //////////////////////////////////////////////
-unsigned long loop_start_time=0;
-const int loop_time=5000; // micro seconds
-void loop_time_holder(){
-  if(micros() - loop_start_time > (loop_time+50)) digitalWrite(2, HIGH);
-  else digitalWrite(2, LOW);
-
-  unsigned long while_start_time=micros();
-  while ((micros()- loop_start_time)<loop_time){} 
-  int dt=micros()-loop_start_time;
-  unsigned long while_end_time=micros();
-  Serial.print("while time:");Serial.print(while_end_time-while_start_time);Serial.print("  ");
-  Serial.print("dt:");Serial.print(dt);Serial.print("  ");
-  loop_start_time = micros(); 
-}
-////////////////////////////////////////////// TIME //////////////////////////////////////////////
